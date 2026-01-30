@@ -408,6 +408,21 @@
             color: #ff3232;
             border: 1px solid #ff3232;
         }
+
+        @keyframes blink {
+            0%, 50% { opacity: 1; }
+            51%, 100% { opacity: 0; }
+        }
+
+        #recordBtn.recording {
+            background: linear-gradient(135deg, #00ff88 0%, #00cc6a 100%);
+            animation: pulse 1s infinite;
+        }
+
+        @keyframes pulse {
+            0%, 100% { box-shadow: 0 0 0 0 rgba(255, 68, 68, 0.4); }
+            50% { box-shadow: 0 0 0 10px rgba(255, 68, 68, 0); }
+        }
     </style>
 </head>
 <body>
@@ -500,15 +515,28 @@
 
                     <div class="form-group">
                         <label for="refAudio">Reference Audio</label>
-                        <input type="file" id="refAudio" accept="audio/*" style="
-                            background: rgba(10, 10, 15, 0.8);
-                            border: 1px solid rgba(255, 255, 255, 0.1);
-                            border-radius: 8px;
-                            padding: 15px;
-                            color: #fff;
-                            width: 100%;
-                        ">
-                        <small style="color: #666; font-size: 11px;">Upload a 5-10 second audio file (WAV, MP3, etc.)</small>
+                        <div style="display: flex; gap: 10px; align-items: center; margin-bottom: 10px;">
+                            <input type="file" id="refAudio" accept="audio/*" style="
+                                background: rgba(10, 10, 15, 0.8);
+                                border: 1px solid rgba(255, 255, 255, 0.1);
+                                border-radius: 8px;
+                                padding: 15px;
+                                color: #fff;
+                                flex: 1;
+                            ">
+                            <button type="button" id="recordBtn" class="btn" style="
+                                padding: 15px 20px;
+                                min-width: 140px;
+                                background: linear-gradient(135deg, #ff4444 0%, #cc0000 100%);
+                            ">
+                                <span class="btn-text" id="recordBtnText">🎤 Record</span>
+                                <span class="spinner"></span>
+                            </button>
+                        </div>
+                        <div id="recordingIndicator" style="display: none; color: #ff4444; font-size: 12px; margin-bottom: 10px;">
+                            <span style="animation: blink 1s infinite;">●</span> Recording... <span id="recordingTime">0:00</span>
+                        </div>
+                        <small style="color: #666; font-size: 11px;">Upload a 5-10 second audio file (WAV, MP3) or record from microphone</small>
                     </div>
 
                     <div class="audio-container" id="refAudioPreview" style="margin-top: 0;">
@@ -952,6 +980,199 @@ response.<span class="function">stream_to_file</span>(<span class="string">"outp
 
         // Check voice clone capabilities on page load
         checkVoiceCloneCapabilities();
+
+        // Microphone recording functionality
+        const recordBtn = document.getElementById('recordBtn');
+        const recordBtnText = document.getElementById('recordBtnText');
+        const recordingIndicator = document.getElementById('recordingIndicator');
+        const recordingTimeDisplay = document.getElementById('recordingTime');
+
+        let mediaRecorder = null;
+        let audioChunks = [];
+        let isRecording = false;
+        let recordingStartTime = null;
+        let recordingTimer = null;
+        let audioContext = null;
+
+        recordBtn.addEventListener('click', async () => {
+            if (isRecording) {
+                stopRecording();
+            } else {
+                await startRecording();
+            }
+        });
+
+        async function startRecording() {
+            try {
+                const stream = await navigator.mediaDevices.getUserMedia({
+                    audio: {
+                        sampleRate: 24000,
+                        channelCount: 1,
+                        echoCancellation: true,
+                        noiseSuppression: true
+                    }
+                });
+
+                audioChunks = [];
+
+                // Try to use WAV-compatible format, fallback to webm
+                const mimeTypes = ['audio/wav', 'audio/webm;codecs=pcm', 'audio/webm', 'audio/ogg'];
+                let selectedMimeType = '';
+                for (const mimeType of mimeTypes) {
+                    if (MediaRecorder.isTypeSupported(mimeType)) {
+                        selectedMimeType = mimeType;
+                        break;
+                    }
+                }
+
+                mediaRecorder = new MediaRecorder(stream, selectedMimeType ? { mimeType: selectedMimeType } : {});
+
+                mediaRecorder.ondataavailable = (event) => {
+                    if (event.data.size > 0) {
+                        audioChunks.push(event.data);
+                    }
+                };
+
+                mediaRecorder.onstop = async () => {
+                    stream.getTracks().forEach(track => track.stop());
+
+                    const audioBlob = new Blob(audioChunks, { type: mediaRecorder.mimeType });
+
+                    // Convert to WAV for compatibility with soundfile/libsndfile
+                    try {
+                        const wavBlob = await convertToWav(audioBlob);
+
+                        // Create a File object from the WAV blob
+                        const wavFile = new File([wavBlob], 'recording.wav', { type: 'audio/wav' });
+
+                        // Update the file input with the recorded audio
+                        const dataTransfer = new DataTransfer();
+                        dataTransfer.items.add(wavFile);
+                        refAudioInput.files = dataTransfer.files;
+
+                        // Trigger change event to update preview
+                        refAudioInput.dispatchEvent(new Event('change'));
+
+                        showCloneStatus('Recording saved as WAV!', 'success');
+                    } catch (error) {
+                        console.error('WAV conversion failed:', error);
+                        showCloneStatus('Recording failed: ' + error.message, 'error');
+                    }
+                };
+
+                mediaRecorder.start(100); // Collect data every 100ms
+                isRecording = true;
+                recordBtn.classList.add('recording');
+                recordBtnText.textContent = '⏹ Stop';
+                recordingIndicator.style.display = 'block';
+
+                // Start timer
+                recordingStartTime = Date.now();
+                recordingTimer = setInterval(updateRecordingTime, 100);
+
+            } catch (error) {
+                console.error('Error starting recording:', error);
+                showCloneStatus('Microphone access denied or not available', 'error');
+            }
+        }
+
+        function stopRecording() {
+            if (mediaRecorder && isRecording) {
+                mediaRecorder.stop();
+                isRecording = false;
+                recordBtn.classList.remove('recording');
+                recordBtnText.textContent = '🎤 Record';
+                recordingIndicator.style.display = 'none';
+
+                if (recordingTimer) {
+                    clearInterval(recordingTimer);
+                    recordingTimer = null;
+                }
+            }
+        }
+
+        function updateRecordingTime() {
+            if (recordingStartTime) {
+                const elapsed = Math.floor((Date.now() - recordingStartTime) / 1000);
+                const minutes = Math.floor(elapsed / 60);
+                const seconds = elapsed % 60;
+                recordingTimeDisplay.textContent = `${minutes}:${seconds.toString().padStart(2, '0')}`;
+            }
+        }
+
+        // Convert any audio blob to WAV format using Web Audio API
+        async function convertToWav(audioBlob) {
+            // Create audio context if not exists
+            if (!audioContext) {
+                audioContext = new (window.AudioContext || window.webkitAudioContext)();
+            }
+
+            // Decode the audio blob
+            const arrayBuffer = await audioBlob.arrayBuffer();
+            const audioBuffer = await audioContext.decodeAudioData(arrayBuffer);
+
+            // Convert to WAV
+            const wavBuffer = audioBufferToWav(audioBuffer);
+            return new Blob([wavBuffer], { type: 'audio/wav' });
+        }
+
+        // Convert AudioBuffer to WAV format
+        function audioBufferToWav(audioBuffer) {
+            const numChannels = 1; // Force mono
+            const sampleRate = audioBuffer.sampleRate;
+            const format = 1; // PCM
+            const bitDepth = 16;
+
+            // Get audio data (mono - use first channel or mix down)
+            let audioData;
+            if (audioBuffer.numberOfChannels === 1) {
+                audioData = audioBuffer.getChannelData(0);
+            } else {
+                // Mix down to mono
+                audioData = new Float32Array(audioBuffer.length);
+                for (let i = 0; i < audioBuffer.numberOfChannels; i++) {
+                    const channelData = audioBuffer.getChannelData(i);
+                    for (let j = 0; j < audioBuffer.length; j++) {
+                        audioData[j] += channelData[j] / audioBuffer.numberOfChannels;
+                    }
+                }
+            }
+
+            const dataLength = audioData.length * (bitDepth / 8);
+            const buffer = new ArrayBuffer(44 + dataLength);
+            const view = new DataView(buffer);
+
+            // WAV header
+            writeString(view, 0, 'RIFF');
+            view.setUint32(4, 36 + dataLength, true);
+            writeString(view, 8, 'WAVE');
+            writeString(view, 12, 'fmt ');
+            view.setUint32(16, 16, true); // fmt chunk size
+            view.setUint16(20, format, true);
+            view.setUint16(22, numChannels, true);
+            view.setUint32(24, sampleRate, true);
+            view.setUint32(28, sampleRate * numChannels * (bitDepth / 8), true);
+            view.setUint16(32, numChannels * (bitDepth / 8), true);
+            view.setUint16(34, bitDepth, true);
+            writeString(view, 36, 'data');
+            view.setUint32(40, dataLength, true);
+
+            // Write audio data
+            const offset = 44;
+            for (let i = 0; i < audioData.length; i++) {
+                const sample = Math.max(-1, Math.min(1, audioData[i]));
+                const intSample = sample < 0 ? sample * 0x8000 : sample * 0x7FFF;
+                view.setInt16(offset + i * 2, intSample, true);
+            }
+
+            return buffer;
+        }
+
+        function writeString(view, offset, string) {
+            for (let i = 0; i < string.length; i++) {
+                view.setUint8(offset + i, string.charCodeAt(i));
+            }
+        }
     </script>
 </body>
 </html>

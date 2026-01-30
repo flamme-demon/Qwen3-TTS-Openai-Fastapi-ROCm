@@ -446,10 +446,61 @@ async def create_voice_clone(
                 },
             )
 
-        # Load audio using soundfile
+        # Load audio using soundfile, with pydub fallback for more formats (MP3, WebM, etc.)
         try:
             audio_buffer = io.BytesIO(audio_bytes)
-            ref_audio, ref_sr = sf.read(audio_buffer)
+            try:
+                # Try soundfile first (supports WAV, FLAC, OGG)
+                ref_audio, ref_sr = sf.read(audio_buffer)
+            except Exception as sf_error:
+                # Fallback to pydub for more formats (MP3, WebM, M4A, etc.)
+                logger.info(f"soundfile failed ({sf_error}), trying pydub fallback")
+                try:
+                    from pydub import AudioSegment
+
+                    audio_buffer.seek(0)
+                    # Try to detect format or use generic
+                    audio_segment = AudioSegment.from_file(audio_buffer)
+
+                    # Convert to numpy array
+                    ref_sr = audio_segment.frame_rate
+                    samples = np.array(audio_segment.get_array_of_samples())
+
+                    # Handle stereo
+                    if audio_segment.channels == 2:
+                        samples = samples.reshape((-1, 2)).mean(axis=1)
+
+                    # Normalize to float32 [-1, 1]
+                    if audio_segment.sample_width == 1:  # 8-bit
+                        ref_audio = (samples.astype(np.float32) - 128) / 128.0
+                    elif audio_segment.sample_width == 2:  # 16-bit
+                        ref_audio = samples.astype(np.float32) / 32768.0
+                    elif audio_segment.sample_width == 4:  # 32-bit
+                        ref_audio = samples.astype(np.float32) / 2147483648.0
+                    else:
+                        ref_audio = samples.astype(np.float32)
+
+                except ImportError:
+                    raise HTTPException(
+                        status_code=400,
+                        detail={
+                            "error": "audio_processing_error",
+                            "message": f"Failed to process reference audio: {sf_error}. "
+                                       "pydub is not installed for format fallback. "
+                                       "Please use WAV format or install pydub.",
+                            "type": "invalid_request_error",
+                        },
+                    )
+                except Exception as pydub_error:
+                    raise HTTPException(
+                        status_code=400,
+                        detail={
+                            "error": "audio_processing_error",
+                            "message": f"Failed to process reference audio with both soundfile ({sf_error}) "
+                                       f"and pydub ({pydub_error}). Please use a valid WAV or MP3 file.",
+                            "type": "invalid_request_error",
+                        },
+                    )
 
             # Convert to mono if stereo
             if len(ref_audio.shape) > 1:
@@ -457,6 +508,8 @@ async def create_voice_clone(
 
             ref_audio = ref_audio.astype(np.float32)
 
+        except HTTPException:
+            raise
         except Exception as e:
             raise HTTPException(
                 status_code=400,
