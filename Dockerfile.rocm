@@ -1,0 +1,226 @@
+# Qwen3-TTS OpenAI-Compatible API Server
+# Dockerfile optimized for AMD ROCm (RX 7900 XT/XTX, RDNA3)
+
+# =============================================================================
+# Production image with ROCm and PyTorch
+# =============================================================================
+FROM rocm/pytorch:rocm6.4.4_ubuntu24.04_py3.12_pytorch_release_2.7.1 AS production
+
+# Prevent interactive prompts during package installation
+ENV DEBIAN_FRONTEND=noninteractive
+ENV PYTHONUNBUFFERED=1
+ENV PYTHONDONTWRITEBYTECODE=1
+ENV NUMBA_CACHE_DIR=/tmp/numba_cache
+
+# ROCm environment variables for RDNA3 (gfx1100)
+ENV HSA_OVERRIDE_GFX_VERSION=11.0.0
+ENV ROCM_PATH=/opt/rocm
+ENV HIP_VISIBLE_DEVICES=0
+
+# Install system dependencies
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
+    git \
+    curl \
+    ffmpeg \
+    libsndfile1 \
+    libsox-dev \
+    sox \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+# Copy dependency files first for better caching
+COPY pyproject.toml README.md ./
+
+# Install Python dependencies (PyTorch already in base image, DO NOT upgrade torch!)
+# Install torchaudio and torchvision from ROCm index to match PyTorch version
+RUN pip install --no-cache-dir --force-reinstall \
+    --index-url https://download.pytorch.org/whl/rocm6.2 \
+    torchaudio torchvision
+
+# Use transformers 4.x (5.x has breaking changes with this model)
+RUN pip install --no-cache-dir \
+    "transformers>=4.45.0,<5.0.0" \
+    accelerate>=1.0.0 \
+    librosa \
+    soundfile \
+    pydub \
+    numpy \
+    scipy \
+    einops \
+    onnxruntime \
+    fastapi>=0.109.0 \
+    "uvicorn[standard]>=0.27.0" \
+    python-multipart \
+    pydantic>=2.0.0 \
+    inflect \
+    aiofiles \
+    sox
+
+# Note: flash-attn is NOT compatible with ROCm
+# ROCm has its own optimized attention via PyTorch's native implementation
+
+# Copy application code
+COPY . .
+
+# Install the package WITHOUT dependencies (to avoid overwriting ROCm PyTorch)
+RUN pip install --no-cache-dir --no-deps -e .
+
+# Create non-root user for security
+RUN useradd --create-home --shell /bin/bash appuser \
+    && mkdir -p /tmp/numba_cache \
+    && chown -R appuser:appuser /app /tmp/numba_cache
+USER appuser
+
+# Environment variables
+ENV HOST=0.0.0.0
+ENV PORT=8880
+ENV WORKERS=1
+ENV PYTHONPATH=/app
+ENV TTS_BACKEND=official
+
+# Expose port
+EXPOSE 8880
+
+# Health check
+HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \
+    CMD curl -f http://localhost:8880/health || exit 1
+
+# Run the server
+CMD ["python", "-m", "api.main"]
+
+# =============================================================================
+# vLLM-Omni backend (experimental for ROCm)
+# =============================================================================
+FROM rocm/pytorch:rocm6.4.4_ubuntu24.04_py3.12_pytorch_release_2.7.1 AS vllm-production
+
+ENV DEBIAN_FRONTEND=noninteractive
+ENV PYTHONUNBUFFERED=1
+ENV PYTHONDONTWRITEBYTECODE=1
+ENV NUMBA_CACHE_DIR=/tmp/numba_cache
+ENV HSA_OVERRIDE_GFX_VERSION=11.0.0
+ENV ROCM_PATH=/opt/rocm
+ENV HIP_VISIBLE_DEVICES=0
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
+    git \
+    curl \
+    ffmpeg \
+    libsndfile1 \
+    libsox-dev \
+    sox \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+COPY pyproject.toml README.md ./
+
+# Install vLLM for ROCm (experimental) + other dependencies
+RUN pip install --no-cache-dir \
+    transformers>=4.40.0 \
+    accelerate>=1.0.0 \
+    librosa \
+    soundfile \
+    pydub \
+    numpy \
+    scipy \
+    einops \
+    onnxruntime \
+    fastapi>=0.109.0 \
+    "uvicorn[standard]>=0.27.0" \
+    python-multipart \
+    pydantic>=2.0.0 \
+    inflect \
+    aiofiles \
+    && pip install --no-cache-dir vllm || echo "vLLM ROCm installation failed, continuing without it..."
+
+COPY . .
+
+RUN pip install --no-cache-dir -e ".[vllm]" || pip install --no-cache-dir -e .
+
+RUN useradd --create-home --shell /bin/bash appuser \
+    && mkdir -p /tmp/numba_cache \
+    && chown -R appuser:appuser /app /tmp/numba_cache
+USER appuser
+
+ENV HOST=0.0.0.0
+ENV PORT=8880
+ENV WORKERS=1
+ENV PYTHONPATH=/app
+ENV TTS_BACKEND=vllm_omni
+
+EXPOSE 8880
+
+HEALTHCHECK --interval=30s --timeout=10s --start-period=90s --retries=3 \
+    CMD curl -f http://localhost:8880/health || exit 1
+
+CMD ["python", "-m", "api.main"]
+
+# =============================================================================
+# CPU-only variant
+# =============================================================================
+FROM python:3.11-slim AS cpu-base
+
+ENV PYTHONUNBUFFERED=1
+ENV PYTHONDONTWRITEBYTECODE=1
+ENV NUMBA_CACHE_DIR=/tmp/numba_cache
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
+    git \
+    curl \
+    ffmpeg \
+    libsndfile1 \
+    libsox-dev \
+    sox \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+COPY pyproject.toml README.md ./
+
+RUN pip install --no-cache-dir --upgrade pip setuptools wheel \
+    && pip install --no-cache-dir \
+    torch>=2.0.0 \
+    torchaudio>=2.0.0 \
+    --index-url https://download.pytorch.org/whl/cpu
+
+RUN pip install --no-cache-dir \
+    transformers>=4.40.0 \
+    accelerate>=1.0.0 \
+    librosa \
+    soundfile \
+    pydub \
+    numpy \
+    scipy \
+    einops \
+    onnxruntime \
+    fastapi>=0.109.0 \
+    "uvicorn[standard]>=0.27.0" \
+    python-multipart \
+    pydantic>=2.0.0 \
+    inflect \
+    aiofiles
+
+COPY . .
+
+RUN pip install --no-cache-dir -e .
+
+RUN useradd --create-home --shell /bin/bash appuser \
+    && mkdir -p /tmp/numba_cache \
+    && chown -R appuser:appuser /app /tmp/numba_cache
+USER appuser
+
+ENV HOST=0.0.0.0
+ENV PORT=8880
+ENV WORKERS=1
+ENV PYTHONPATH=/app
+
+EXPOSE 8880
+
+HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \
+    CMD curl -f http://localhost:8880/health || exit 1
+
+CMD ["python", "-m", "api.main"]
