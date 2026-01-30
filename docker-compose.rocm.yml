@@ -1,0 +1,63 @@
+# Docker Compose for Qwen3-TTS with AMD ROCm (RX 7900 XT/XTX)
+# Usage: docker compose up -d
+
+services:
+  qwen3-tts:
+    build:
+      context: .
+      dockerfile: Dockerfile.rocm
+      target: production  # ou vllm-production pour le backend vLLM
+    image: qwen3-tts:rocm
+    container_name: qwen3-tts
+    
+    # GPU AMD ROCm
+    devices:
+      - /dev/kfd:/dev/kfd
+      - /dev/dri:/dev/dri
+    group_add:
+      - video
+      - render
+    
+    environment:
+      - HSA_OVERRIDE_GFX_VERSION=11.0.0
+      - HIP_VISIBLE_DEVICES=0
+      - TTS_BACKEND=official
+      - TTS_MODEL_NAME=Qwen/Qwen3-TTS-12Hz-1.7B-Base
+      # - TTS_BACKEND=vllm_omni  # Décommenter pour utiliser vLLM
+    
+    ports:
+      - "8880:8880"
+    
+    volumes:
+      # Monter un cache pour les modèles HuggingFace
+      - ~/.cache/huggingface:/home/appuser/.cache/huggingface
+      # Optionnel: monter vos fichiers locaux
+      # - ./models:/app/models
+    
+    restart: unless-stopped
+    
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8880/health"]
+      interval: 30s
+      timeout: 10s
+      start_period: 120s  # Les modèles TTS peuvent être longs à charger
+      retries: 3
+
+  # Service CPU uniquement (alternative sans GPU)
+  qwen3-tts-cpu:
+    build:
+      context: .
+      dockerfile: Dockerfile.rocm
+      target: cpu-base
+    image: qwen3-tts:cpu
+    container_name: qwen3-tts-cpu
+    profiles:
+      - cpu  # Activer avec: docker compose --profile cpu up
+    
+    ports:
+      - "8881:8880"
+    
+    volumes:
+      - ~/.cache/huggingface:/home/appuser/.cache/huggingface
+    
+    restart: unless-stopped
